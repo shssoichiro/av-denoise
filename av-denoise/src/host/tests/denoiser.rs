@@ -17,7 +17,10 @@ use av_denoise_core::{
     PlaneSource,
     WindowSpan,
 };
+use cubecl::MemoryScope;
 
+use crate::accelerate::Accelerator;
+use crate::backend::DevicePlacement;
 use crate::host::{Algorithm, ChannelIntent, DenoiserError, DenoiserOptions, HostDenoiser, OUTPUT_SETS};
 
 fn luma_options(mode: DenoisingMode) -> DenoiserOptions {
@@ -105,6 +108,45 @@ fn spatial_denoise_roundtrip() {
     let output_plane = luma_plane(planes);
 
     assert_eq!(output_plane.len(), 16 * 16);
+}
+
+#[test]
+fn dropping_the_denoiser_releases_pool_pages_from_an_exited_worker() {
+    // Use a private Vulkan client so concurrent tests cannot affect the memory report.
+    let denoiser = std::thread::spawn(|| {
+        let placement = DevicePlacement::own();
+        let options = luma_options(DenoisingMode::Spacial);
+        let mut denoiser = HostDenoiser::create_with(
+            &[Accelerator::Vulkan],
+            &crate::testing::test_device(),
+            &placement,
+            128,
+            128,
+            options,
+        )
+        .expect("denoiser construction failed");
+        assert!(placement.opened().is_some(), "the test needs a private device");
+        denoiser.push(&[&frame(128, 128)]).expect("push failed");
+        // Leave the readback pending so teardown must release its buffers too.
+        cubecl::future::block_on(denoiser.client().sync()).expect("denoise work failed");
+        denoiser
+    })
+    .join()
+    .expect("render worker failed");
+
+    let client = denoiser.client().clone();
+    let reserved_bytes = || {
+        client
+            .memory_report(MemoryScope::Device)
+            .streams
+            .iter()
+            .map(|stream| stream.pools.usage().bytes_reserved)
+            .sum::<u64>()
+    };
+
+    assert!(reserved_bytes() > 0, "rendering should have allocated pages");
+    drop(denoiser);
+    assert_eq!(reserved_bytes(), 0, "empty GPU pool pages survived teardown");
 }
 
 #[test]

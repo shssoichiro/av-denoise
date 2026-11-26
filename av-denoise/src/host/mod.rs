@@ -136,6 +136,20 @@ pub struct HostDenoiser {
     sink_time: Duration,
     /// Frames handed back to the caller.
     frames_emitted: u64,
+    /// Keep last: the engine, output buffers, and pending readbacks must drop before cleanup.
+    _release_pool_pages: ReleasePoolPages,
+}
+
+struct ReleasePoolPages(Client);
+
+impl Drop for ReleasePoolPages {
+    fn drop(&mut self) {
+        // Dropping buffers leaves empty pages reserved. Cleanup visits every stream on the
+        // client, including those of other denoisers, so only do this at teardown.
+        if let Err(error) = self.0.memory_cleanup() {
+            tracing::warn!(?error, "the denoiser's memory cleanup failed");
+        }
+    }
 }
 
 impl HostDenoiser {
@@ -211,7 +225,7 @@ impl HostDenoiser {
             io: built.io,
             accelerator: built.accelerator,
             selected: built.selected,
-            client: built.client,
+            client: built.client.clone(),
             spec,
             plane_dims,
             plane_lengths,
@@ -224,6 +238,7 @@ impl HostDenoiser {
             output_wait: Duration::ZERO,
             sink_time: Duration::ZERO,
             frames_emitted: 0,
+            _release_pool_pages: ReleasePoolPages(built.client),
         })
     }
 
